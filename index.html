@@ -105,7 +105,7 @@
     .avatar { width: 38px; height: 38px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; color: white; background: linear-gradient(135deg, var(--accent-2), var(--accent)); flex-shrink: 0; }
     .me-info { flex: 1; min-width: 0; }
     .me-name { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .me-id { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .me-id { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: 'Courier New', monospace; letter-spacing: 0.5px; }
     .me-actions { display: flex; gap: 6px; margin-top: 8px; }
 
     .section-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px 6px; }
@@ -121,7 +121,7 @@
     .friend-left { display: flex; align-items: center; gap: 9px; min-width: 0; }
     .friend-info { min-width: 0; }
     .friend-name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .friend-id-small { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .friend-id-small { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: 'Courier New', monospace; letter-spacing: 0.5px; }
     .friend-actions { display: flex; gap: 4px; flex-shrink: 0; }
 
     /* ── CHAT AREA ── */
@@ -134,7 +134,7 @@
       display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
     }
     .chat-title { font-family: var(--font-head); font-weight: 700; font-size: 16px; }
-    .chat-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .chat-sub { font-size: 12px; color: var(--muted); margin-top: 2px; font-family: 'Courier New', monospace; }
 
     .messages {
       flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column;
@@ -674,15 +674,30 @@
     if(!data.length) { msgsEl.innerHTML='<div class="empty-state"><div class="empty-icon">👋</div><div>No messages yet — say hi!</div></div>'; }
     else { data.forEach(m => appendMsg(m, false)); scrollBottom(false); }
 
-    // subscribe to new messages
-    channel = sb.channel('room_'+activeRoom)
-      .on('postgres_changes', {
-        event: 'INSERT', schema: 'public', table: 'messages',
-        filter: `azyra_room=eq.${activeRoom}`
-      }, payload => {
-        appendMsg(payload.new, true);
-      })
-      .subscribe();
+    // subscribe to new messages in this room
+    channel = sb.channel('room_' + activeRoom, {
+      config: { broadcast: { self: false } }
+    })
+    .on('postgres_changes', {
+      event: 'INSERT',
+      schema: 'public',
+      table: 'messages',
+      filter: `azyra_room=eq.${activeRoom}`
+    }, payload => {
+      const row = payload.new;
+      // Only render if it's from the OTHER person (we already rendered our own optimistically)
+      if(row.sender_id !== myId) {
+        appendMsg(row, true);
+      }
+    })
+    .subscribe((status, err) => {
+      if(status === 'SUBSCRIBED') {
+        console.log('Realtime connected for room:', activeRoom);
+      }
+      if(status === 'CHANNEL_ERROR') {
+        console.error('Realtime error:', err);
+      }
+    });
   }
 
   function appendMsg(row, scroll=true) {
