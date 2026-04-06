@@ -427,11 +427,13 @@
   // ─── CONFIG ───────────────────────────────────────────────
   const SUPABASE_URL = 'https://ludcshwxhsgsipgajxjs.supabase.co';
   const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx1ZGNzaHd4aHNnc2lwZ2FqeGpzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUyNjg1NDIsImV4cCI6MjA5MDg0NDU0Mn0.qMg6sP1pKCDQ1JZFcaR6Y4gwHKr4kp68TR12Xin0ZNs';
+  const FN = SUPABASE_URL + '/functions/v1'; // Edge Function base URL
   const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
 
   // ─── STATE ────────────────────────────────────────────────
-  let myId   = localStorage.getItem('az_id')   || null;
-  let myName = localStorage.getItem('az_name') || null;
+  let myId    = localStorage.getItem('az_id')    || null;
+  let myName  = localStorage.getItem('az_name')  || null;
+  let myToken = localStorage.getItem('az_token') || null;
   let friends = [];          // [{ friend_azyra_id, friend_name }]
   let activeFriendId = null;
   let activeRoom     = null;
@@ -541,80 +543,23 @@
 
     const hashed = await sha256(pass);
 
-    if(authMode === 'signup') {
-      // Generate unique salt for this user
-      const salt = generateSalt();
-      const saltedHash = await hashWithSalt(pass, salt);
-      const newId = genId();
-
-      const res = await fetch(SUPABASE_URL + '/rest/v1/users', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'apikey': SUPABASE_KEY,
-          'Authorization': 'Bearer ' + SUPABASE_KEY,
-          'Prefer': 'return=representation'
-        },
-        body: JSON.stringify({ name, password: saltedHash, salt, azyra_id: newId })
-      });
-      const json = await res.json();
-      if(!res.ok) {
-        const msg = json?.message || json?.[0]?.message || '';
-        st.textContent = msg.includes('unique') ? 'Username already taken — try another.' : 'Signup failed: ' + msg;
-        st.classList.add('error');
-      } else {
-        const row = Array.isArray(json) ? json[0] : json;
-        myId = row.azyra_id; myName = row.name;
-        localStorage.setItem('az_id', myId); localStorage.setItem('az_name', myName);
-        await afterLogin();
-      }
+    // Both signup and login go through Edge Function — secure server-side
+    const action = authMode === 'signup' ? 'signup' : 'login';
+    const res = await fetch(FN + '/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, name, password: pass })
+    });
+    const json = await res.json();
+    if(!res.ok) {
+      st.textContent = json.error || 'Something went wrong. Try again.';
+      st.classList.add('error');
     } else {
-      // LOGIN: fetch user by name or azyra_id first (need their salt)
-      const col = name.startsWith('az_') ? 'azyra_id' : 'name';
-      const lookupRes = await fetch(
-        `${SUPABASE_URL}/rest/v1/users?${col}=eq.${encodeURIComponent(name)}&limit=1`,
-        { headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY, 'Accept': 'application/json' } }
-      );
-      const users = await lookupRes.json();
-      const found = Array.isArray(users) ? users[0] : null;
-
-      if(!found) {
-        st.textContent = 'User not found — check your name or Azyra ID.';
-        st.classList.add('error');
-      } else {
-        // If user has salt → use salted hash. If no salt (old account) → use plain hash
-        const expectedHash = found.salt
-          ? await hashWithSalt(pass, found.salt)
-          : await sha256(pass);
-
-        if(expectedHash !== found.password) {
-          st.textContent = 'Wrong password — try again.';
-          st.classList.add('error');
-        } else {
-          // ✅ Login success
-          myId = found.azyra_id; myName = found.name;
-          localStorage.setItem('az_id', myId); localStorage.setItem('az_name', myName);
-
-          // 🔄 Auto-migrate: if old account (no salt), silently upgrade their password now
-          if(!found.salt) {
-            const newSalt = generateSalt();
-            const newHash = await hashWithSalt(pass, newSalt);
-            await fetch(
-              `${SUPABASE_URL}/rest/v1/users?azyra_id=eq.${encodeURIComponent(myId)}`,
-              {
-                method: 'PATCH',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'apikey': SUPABASE_KEY,
-                  'Authorization': 'Bearer ' + SUPABASE_KEY
-                },
-                body: JSON.stringify({ password: newHash, salt: newSalt })
-              }
-            );
-          }
-          await afterLogin();
-        }
-      }
+      myId = json.azyra_id; myName = json.name; myToken = json.token;
+      localStorage.setItem('az_id', myId);
+      localStorage.setItem('az_name', myName);
+      localStorage.setItem('az_token', myToken);
+      await afterLogin();
     }
     $('authSubmit').disabled = false;
   });
@@ -626,6 +571,9 @@
     renderFriends();
     $('authStatus').textContent = '';
     $('authName').value = ''; $('authPass').value = '';
+  }
+  function authHeaders() {
+    return { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + myToken };
   }
 
   // ─── FRIENDS (DB) ─────────────────────────────────────────
@@ -698,14 +646,16 @@
     const msgsEl = $('messages');
     msgsEl.innerHTML = '<div class="empty-state"><div class="loader"></div></div>';
 
-    const { data, error } = await sb.from('messages')
-      .select('*')
-      .eq('azyra_room', activeRoom)
-      .order('created_at', { ascending: true })
-      .limit(500);
+    const res = await fetch(FN + '/get-messages', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ room_id: activeRoom })
+    });
+    const json = await res.json();
 
     msgsEl.innerHTML = '';
-    if(error) { msgsEl.innerHTML='<div class="empty-state" style="color:#f87171">Failed to load messages.</div>'; return; }
+    if(!res.ok) { msgsEl.innerHTML='<div class="empty-state" style="color:#f87171">Failed to load messages: '+( json.error||'unknown')+'</div>'; return; }
+    const data = json.messages || [];
     if(!data.length) { msgsEl.innerHTML='<div class="empty-state"><div class="empty-icon">👋</div><div>No messages yet — say hi!</div></div>'; }
     else { data.forEach(m => appendMsg(m, false)); scrollBottom(false); }
 
@@ -785,22 +735,24 @@
       created_at: new Date().toISOString()
     }, true);
 
-    const { data, error } = await sb.from('messages').insert([{
-      sender_id:   myId,
-      receiver_id: activeFriendId,
-      content:     text,
-      azyra_room:  activeRoom
-    }]).select().single();
-
-    if(error) {
-      // Remove optimistic message on failure
+    const res = await fetch(FN + '/send-message', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        receiver_id: activeFriendId,
+        content: text,
+        azyra_room: activeRoom
+      })
+    });
+    const json = await res.json();
+    if(!res.ok) {
       document.getElementById('msg_'+tempId)?.remove();
-      alert('Send failed: '+error.message);
+      alert('Send failed: ' + (json.error || 'unknown error'));
       return;
     }
     // Replace temp ID with real DB id to prevent duplicate on realtime event
     const tempEl = document.getElementById('msg_'+tempId);
-    if(tempEl && data?.id) tempEl.id = 'msg_'+data.id;
+    if(tempEl && json.message?.id) tempEl.id = 'msg_'+json.message.id;
   }
 
   // ─── UI EVENTS ────────────────────────────────────────────
@@ -865,8 +817,8 @@
   // logout
   $('logoutBtn').addEventListener('click', async () => {
     if(!confirm('Logout from this device?')) return;
-    localStorage.removeItem('az_id'); localStorage.removeItem('az_name');
-    myId=null; myName=null; friends=[]; activeFriendId=null; activeRoom=null;
+    localStorage.removeItem('az_id'); localStorage.removeItem('az_name'); localStorage.removeItem('az_token');
+    myId=null; myName=null; myToken=null; friends=[]; activeFriendId=null; activeRoom=null;
     if(channel){ sb.removeChannel(channel); channel=null; }
     renderMe(); renderFriends();
     $('chatTitle').textContent='No chat selected';
