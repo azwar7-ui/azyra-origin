@@ -661,30 +661,29 @@
     if(!data.length) { msgsEl.innerHTML='<div class="empty-state"><div class="empty-icon">👋</div><div>No messages yet — say hi!</div></div>'; }
     else { data.forEach(m => appendMsg(m, false)); scrollBottom(false); }
 
-    // subscribe to new messages in this room
-    channel = sb.channel('room_' + activeRoom, {
-      config: { broadcast: { self: false } }
-    })
-    .on('postgres_changes', {
-      event: 'INSERT',
-      schema: 'public',
-      table: 'messages',
-      filter: `azyra_room=eq.${activeRoom}`
-    }, payload => {
-      const row = payload.new;
-      // Only render if it's from the OTHER person (we already rendered our own optimistically)
-      if(row.sender_id !== myId) {
-        appendMsg(row, true);
-      }
-    })
-    .subscribe((status, err) => {
-      if(status === 'SUBSCRIBED') {
-        console.log('Realtime connected for room:', activeRoom);
-      }
-      if(status === 'CHANNEL_ERROR') {
-        console.error('Realtime error:', err);
-      }
-    });
+    // Subscribe to realtime — fresh channel per room
+    const roomName = 'room_' + activeRoom;
+    channel = sb.channel(roomName)
+      .on(
+        'postgres_changes',
+        {
+          event:  'INSERT',
+          schema: 'public',
+          table:  'messages',
+          filter: `azyra_room=eq.${activeRoom}`
+        },
+        payload => {
+          const row = payload.new;
+          // Only render messages from the OTHER person
+          // Our own messages are rendered optimistically on send
+          if(row.sender_id !== myId) {
+            appendMsg(row, true);
+          }
+        }
+      )
+      .subscribe(status => {
+        console.log('[Azyra Realtime]', status, activeRoom);
+      });
   }
 
   function appendMsg(row, scroll=true) {
