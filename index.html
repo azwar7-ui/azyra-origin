@@ -458,6 +458,14 @@
     const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
     return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,'0')).join('');
   }
+  function generateSalt() {
+    // 16 random bytes → 32 char hex string
+    const arr = crypto.getRandomValues(new Uint8Array(16));
+    return [...arr].map(b=>b.toString(16).padStart(2,'0')).join('');
+  }
+  async function hashWithSalt(password, salt) {
+    return await sha256(password + salt);
+  }
   function friendName(fid) {
     const f = friends.find(x=>x.friend_azyra_id===fid);
     return f?.friend_name || fid;
@@ -534,8 +542,11 @@
     const hashed = await sha256(pass);
 
     if(authMode === 'signup') {
+      // Generate unique salt for this user
+      const salt = generateSalt();
+      const saltedHash = await hashWithSalt(pass, salt);
       const newId = genId();
-      // Use raw fetch — bypasses Supabase SDK BroadcastChannel/postMessage bug
+
       const res = await fetch(SUPABASE_URL + '/rest/v1/users', {
         method: 'POST',
         headers: {
@@ -544,7 +555,7 @@
           'Authorization': 'Bearer ' + SUPABASE_KEY,
           'Prefer': 'return=representation'
         },
-        body: JSON.stringify({ name, password: hashed, azyra_id: newId })
+        body: JSON.stringify({ name, password: saltedHash, salt, azyra_id: newId })
       });
       const json = await res.json();
       if(!res.ok) {
@@ -558,27 +569,51 @@
         await afterLogin();
       }
     } else {
-      // login: raw fetch SELECT — no SDK issues
+      // LOGIN: fetch user by name or azyra_id first (need their salt)
       const col = name.startsWith('az_') ? 'azyra_id' : 'name';
-      const res = await fetch(
-        `${SUPABASE_URL}/rest/v1/users?${col}=eq.${encodeURIComponent(name)}&password=eq.${encodeURIComponent(hashed)}&limit=1`,
-        {
-          headers: {
-            'apikey': SUPABASE_KEY,
-            'Authorization': 'Bearer ' + SUPABASE_KEY,
-            'Accept': 'application/json'
-          }
-        }
+      const lookupRes = await fetch(
+        `${SUPABASE_URL}/rest/v1/users?${col}=eq.${encodeURIComponent(name)}&limit=1`,
+        { headers: { 'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY, 'Accept': 'application/json' } }
       );
-      const json = await res.json();
-      const row = Array.isArray(json) ? json[0] : null;
-      if(!row) {
-        st.textContent = 'Wrong credentials — check name/ID and password.';
+      const users = await lookupRes.json();
+      const found = Array.isArray(users) ? users[0] : null;
+
+      if(!found) {
+        st.textContent = 'User not found — check your name or Azyra ID.';
         st.classList.add('error');
       } else {
-        myId = row.azyra_id; myName = row.name;
-        localStorage.setItem('az_id', myId); localStorage.setItem('az_name', myName);
-        await afterLogin();
+        // If user has salt → use salted hash. If no salt (old account) → use plain hash
+        const expectedHash = found.salt
+          ? await hashWithSalt(pass, found.salt)
+          : await sha256(pass);
+
+        if(expectedHash !== found.password) {
+          st.textContent = 'Wrong password — try again.';
+          st.classList.add('error');
+        } else {
+          // ✅ Login success
+          myId = found.azyra_id; myName = found.name;
+          localStorage.setItem('az_id', myId); localStorage.setItem('az_name', myName);
+
+          // 🔄 Auto-migrate: if old account (no salt), silently upgrade their password now
+          if(!found.salt) {
+            const newSalt = generateSalt();
+            const newHash = await hashWithSalt(pass, newSalt);
+            await fetch(
+              `${SUPABASE_URL}/rest/v1/users?azyra_id=eq.${encodeURIComponent(myId)}`,
+              {
+                method: 'PATCH',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'apikey': SUPABASE_KEY,
+                  'Authorization': 'Bearer ' + SUPABASE_KEY
+                },
+                body: JSON.stringify({ password: newHash, salt: newSalt })
+              }
+            );
+          }
+          await afterLogin();
+        }
       }
     }
     $('authSubmit').disabled = false;
